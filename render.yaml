@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: smartguard-otp-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: SMTP_USER
+        value: smartguardverify@gmail.com
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/firebase-service-account.json
