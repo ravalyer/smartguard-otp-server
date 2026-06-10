@@ -1,19 +1,19 @@
 {
   "name": "smartguard-online-otp-server",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Online OTP email server for SmartGuard",
+  "version": "1.0.1",
+  "description": "Online OTP server for SmartGuard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20 <23"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "firebase-admin": "^13.0.0",
-    "nodemailer": "^6.10.0"
+    "firebase-admin": "^13.0.2",
+    "nodemailer": "^6.9.16"
   }
 }
