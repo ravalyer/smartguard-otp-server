@@ -1,35 +1,37 @@
-require("dotenv").config();
-
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 const admin = require("firebase-admin");
+require("dotenv").config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "20kb" }));
+app.use(express.json({ limit: "64kb" }));
 
 const PORT = Number(process.env.PORT || 3000);
-const SMTP_USER = String(process.env.SMTP_USER || "").trim();
-const SMTP_APP_PASSWORD = String(process.env.SMTP_APP_PASSWORD || "").replace(/\s+/g, "");
-const OTP_HASH_SECRET = String(process.env.OTP_HASH_SECRET || "").trim();
+const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || "";
+const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || "SmartGuard Verification";
+const OTP_HASH_SECRET = process.env.OTP_HASH_SECRET || "";
 
-const OTP_EXPIRY_MS = 5 * 60 * 1000;
-const SMTP_TIMEOUT_MS = 20 * 1000;
-const FIRESTORE_TIMEOUT_MS = 15 * 1000;
-const REQUEST_COOLDOWN_MS = 60 * 1000;
-const MAX_ATTEMPTS = 5;
+const OTP_EXPIRATION_MS = 5 * 60 * 1000;
+const OTP_REQUEST_COOLDOWN_MS = 60 * 1000;
+const OTP_MAX_ATTEMPTS = 5;
+const requestCooldowns = new Map();
 
-function requireEnv(name, value) {
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
+function requireEnvironment() {
+  const missing = [];
+
+  if (!BREVO_API_KEY) missing.push("BREVO_API_KEY");
+  if (!BREVO_SENDER_EMAIL) missing.push("BREVO_SENDER_EMAIL");
+  if (!OTP_HASH_SECRET) missing.push("OTP_HASH_SECRET");
+
+  if (missing.length > 0) {
+    throw new Error(`Missing environment variables: ${missing.join(", ")}`);
   }
 }
 
-requireEnv("SMTP_USER", SMTP_USER);
-requireEnv("SMTP_APP_PASSWORD", SMTP_APP_PASSWORD);
-requireEnv("OTP_HASH_SECRET", OTP_HASH_SECRET);
+requireEnvironment();
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -39,28 +41,6 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: SMTP_USER,
-    pass: SMTP_APP_PASSWORD,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000,
-});
-
-function withTimeout(promise, timeoutMs, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
-    }),
-  ]);
-}
-
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -69,8 +49,8 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-function emailDocumentId(email) {
-  return crypto.createHash("sha256").update(email).digest("hex");
+function createOtp() {
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 function hashOtp(email, otp) {
@@ -80,26 +60,68 @@ function hashOtp(email, otp) {
     .digest("hex");
 }
 
-function createOtp() {
-  return crypto.randomInt(100000, 1000000).toString();
+function safeHashEquals(left, right) {
+  try {
+    const a = Buffer.from(left, "hex");
+    const b = Buffer.from(right, "hex");
+
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
-function safeError(error) {
-  return error instanceof Error ? error.message : String(error);
-}
+async function sendOtpUsingBrevoApi(recipientEmail, otp) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
-app.get("/", (_req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "SmartGuard online OTP server is running.",
-  });
-});
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "api-key": BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: {
+          name: BREVO_SENDER_NAME,
+          email: BREVO_SENDER_EMAIL,
+        },
+        to: [{ email: recipientEmail }],
+        subject: "Your SmartGuard verification code",
+        textContent:
+          `Your SmartGuard verification code is ${otp}.\n\n` +
+          "It expires in 5 minutes. Do not share this code with anyone.",
+        htmlContent:
+          `<div style="font-family:Arial,sans-serif;line-height:1.6">` +
+          `<h2>SmartGuard Verification</h2>` +
+          `<p>Your verification code is:</p>` +
+          `<p style="font-size:30px;font-weight:bold;letter-spacing:6px">${otp}</p>` +
+          `<p>This code expires in 5 minutes. Do not share it with anyone.</p>` +
+          `</div>`,
+      }),
+      signal: controller.signal,
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      throw new Error(
+        `Brevo API returned ${response.status}: ${responseText || "Unknown error"}`
+      );
+    }
+
+    return responseText ? JSON.parse(responseText) : {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 app.get("/health", (_req, res) => {
   res.status(200).json({
     success: true,
     message: "SmartGuard online OTP server is running.",
-    timestamp: new Date().toISOString(),
   });
 });
 
@@ -107,79 +129,57 @@ app.post("/request-otp", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
 
   if (!isValidEmail(email)) {
-    return res.status(400).json({ success: false, message: "Enter a valid email address." });
+    return res.status(400).json({
+      success: false,
+      message: "Enter a valid email address.",
+    });
   }
 
-  const documentId = emailDocumentId(email);
-  const otpRef = db.collection("email_otp_requests").doc(documentId);
+  const now = Date.now();
+  const lastRequestAt = requestCooldowns.get(email) || 0;
+
+  if (now - lastRequestAt < OTP_REQUEST_COOLDOWN_MS) {
+    return res.status(429).json({
+      success: false,
+      message: "Please wait one minute before requesting another OTP.",
+    });
+  }
+
+  requestCooldowns.set(email, now);
+
+  const otp = createOtp();
+  const requestRef = db.collection("email_otp_requests").doc(email);
 
   try {
-    const previous = await withTimeout(otpRef.get(), FIRESTORE_TIMEOUT_MS, "Firestore read");
-    const previousData = previous.exists ? previous.data() : null;
-    const previousCreatedAt = Number(previousData?.createdAtMs || 0);
+    await requestRef.set({
+      email,
+      codeHash: hashOtp(email, otp),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: admin.firestore.Timestamp.fromMillis(now + OTP_EXPIRATION_MS),
+      attempts: 0,
+      consumed: false,
+    });
 
-    if (Date.now() - previousCreatedAt < REQUEST_COOLDOWN_MS) {
-      return res.status(429).json({
-        success: false,
-        message: "Please wait one minute before requesting another OTP.",
-      });
-    }
+    await sendOtpUsingBrevoApi(email, otp);
 
-    const otp = createOtp();
-    const expiresAtMs = Date.now() + OTP_EXPIRY_MS;
-
-    await withTimeout(
-      otpRef.set({
-        email,
-        otpHash: hashOtp(email, otp),
-        expiresAtMs,
-        createdAtMs: Date.now(),
-        attempts: 0,
-        verified: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      }),
-      FIRESTORE_TIMEOUT_MS,
-      "Firestore write"
-    );
-
-    try {
-      await withTimeout(
-        transporter.sendMail({
-          from: `SmartGuard Verification <${SMTP_USER}>`,
-          to: email,
-          subject: "Your SmartGuard verification code",
-          text: `Your SmartGuard verification code is ${otp}.\n\nIt expires in 5 minutes. Do not share this code with anyone.`,
-          html: `
-            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111827;">
-              <h2>SmartGuard Email Verification</h2>
-              <p>Your verification code is:</p>
-              <p style="font-size: 30px; font-weight: 700; letter-spacing: 8px;">${otp}</p>
-              <p>This code expires in 5 minutes. Do not share this code with anyone.</p>
-            </div>
-          `,
-        }),
-        SMTP_TIMEOUT_MS,
-        "SMTP send"
-      );
-    } catch (smtpError) {
-      await otpRef.delete().catch(() => {});
-      console.error("SMTP_SEND_FAILED", safeError(smtpError));
-      return res.status(503).json({
-        success: false,
-        message: "Unable to send OTP email right now. Check the Render logs for SMTP_SEND_FAILED.",
-      });
-    }
-
-    console.log("OTP_SENT", email);
     return res.status(200).json({
       success: true,
       message: "OTP sent. Check your inbox and spam folder.",
     });
   } catch (error) {
-    console.error("REQUEST_OTP_FAILED", safeError(error));
-    return res.status(500).json({
+    console.error("REQUEST_OTP_FAILED", error);
+
+    try {
+      await requestRef.delete();
+    } catch (deleteError) {
+      console.error("OTP_CLEANUP_FAILED", deleteError);
+    }
+
+    requestCooldowns.delete(email);
+
+    return res.status(502).json({
       success: false,
-      message: "Unable to create OTP request. Check the Render logs for REQUEST_OTP_FAILED.",
+      message: "Unable to send OTP. Check the online server logs.",
     });
   }
 });
@@ -189,57 +189,89 @@ app.post("/verify-otp", async (req, res) => {
   const otp = String(req.body?.otp || "").trim();
 
   if (!isValidEmail(email) || !/^\d{6}$/.test(otp)) {
-    return res.status(400).json({ success: false, message: "Enter a valid email and 6-digit OTP." });
+    return res.status(400).json({
+      success: false,
+      message: "Enter a valid email and 6-digit OTP.",
+    });
   }
 
-  const documentId = emailDocumentId(email);
-  const otpRef = db.collection("email_otp_requests").doc(documentId);
-  const verifiedRef = db.collection("verified_email_users").doc(documentId);
+  const requestRef = db.collection("email_otp_requests").doc(email);
 
   try {
-    const snapshot = await withTimeout(otpRef.get(), FIRESTORE_TIMEOUT_MS, "Firestore read");
+    const snapshot = await requestRef.get();
 
     if (!snapshot.exists) {
-      return res.status(400).json({ success: false, message: "OTP request not found. Request a new OTP." });
+      return res.status(400).json({
+        success: false,
+        message: "Request a new OTP first.",
+      });
     }
 
     const data = snapshot.data() || {};
+    const expiresAtMs = data.expiresAt?.toMillis?.() || 0;
     const attempts = Number(data.attempts || 0);
 
-    if (attempts >= MAX_ATTEMPTS) {
-      await otpRef.delete().catch(() => {});
-      return res.status(400).json({ success: false, message: "Too many incorrect attempts. Request a new OTP." });
+    if (data.consumed === true) {
+      return res.status(400).json({
+        success: false,
+        message: "This OTP was already used. Request a new one.",
+      });
     }
 
-    if (Date.now() > Number(data.expiresAtMs || 0)) {
-      await otpRef.delete().catch(() => {});
-      return res.status(400).json({ success: false, message: "OTP expired. Request a new OTP." });
+    if (Date.now() > expiresAtMs) {
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired. Request a new one.",
+      });
     }
 
-    if (data.otpHash !== hashOtp(email, otp)) {
-      await otpRef.update({ attempts: attempts + 1 }).catch(() => {});
-      return res.status(400).json({ success: false, message: "Incorrect OTP." });
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many attempts. Request a new OTP.",
+      });
     }
 
-    await withTimeout(
-      verifiedRef.set({
+    const isCorrect = safeHashEquals(
+      String(data.codeHash || ""),
+      hashOtp(email, otp)
+    );
+
+    if (!isCorrect) {
+      await requestRef.update({
+        attempts: admin.firestore.FieldValue.increment(1),
+      });
+
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect OTP.",
+      });
+    }
+
+    await db.collection("verified_email_users").doc(email).set(
+      {
         email,
         status: "verified",
         verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }),
-      FIRESTORE_TIMEOUT_MS,
-      "Firestore verified-user write"
+      },
+      { merge: true }
     );
 
-    await otpRef.delete().catch(() => {});
+    await requestRef.update({
+      consumed: true,
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
-    console.log("OTP_VERIFIED", email);
-    return res.status(200).json({ success: true, message: "Email verified successfully." });
+    return res.status(200).json({
+      success: true,
+      message: "Email verified successfully.",
+    });
   } catch (error) {
-    console.error("VERIFY_OTP_FAILED", safeError(error));
+    console.error("VERIFY_OTP_FAILED", error);
+
     return res.status(500).json({
       success: false,
-      message: "Unable to verify OTP. Check the Render logs for VERIFY_OTP_FAILED.",
+      message: "Unable to verify OTP. Check the online server logs.",
     });
   }
 });
@@ -248,20 +280,24 @@ app.post("/verification-status", async (req, res) => {
   const email = normalizeEmail(req.body?.email);
 
   if (!isValidEmail(email)) {
-    return res.status(400).json({ success: false, verified: false, message: "Enter a valid email address." });
+    return res.status(400).json({
+      success: false,
+      verified: false,
+      message: "Enter a valid email address.",
+    });
   }
 
   try {
-    const documentId = emailDocumentId(email);
-    const snapshot = await withTimeout(
-      db.collection("verified_email_users").doc(documentId).get(),
-      FIRESTORE_TIMEOUT_MS,
-      "Firestore verification-status read"
-    );
+    const snapshot = await db.collection("verified_email_users").doc(email).get();
+    const verified = snapshot.exists && snapshot.data()?.status === "verified";
 
-    return res.status(200).json({ success: true, verified: snapshot.exists });
+    return res.status(200).json({
+      success: true,
+      verified,
+    });
   } catch (error) {
-    console.error("VERIFICATION_STATUS_FAILED", safeError(error));
+    console.error("VERIFICATION_STATUS_FAILED", error);
+
     return res.status(500).json({
       success: false,
       verified: false,
@@ -271,8 +307,12 @@ app.post("/verification-status", async (req, res) => {
 });
 
 app.use((error, _req, res, _next) => {
-  console.error("UNHANDLED_ERROR", safeError(error));
-  res.status(500).json({ success: false, message: "Unexpected server error." });
+  console.error("UNHANDLED_SERVER_ERROR", error);
+
+  res.status(500).json({
+    success: false,
+    message: "Unexpected server error.",
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
